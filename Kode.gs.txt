@@ -1,0 +1,1350 @@
+const CONFIG = {
+  SESSION_CACHE_SECONDS: 21600,
+  DEFAULT_ADMIN_USERNAME: 'admin',
+  DEFAULT_ADMIN_PASSWORD: 'Admin123!'
+};
+
+const SHEETS = {
+  USERS: 'USERS',
+  STUDENTS: 'STUDENTS',
+  JOURNAL: 'JOURNAL',
+  PPI: 'PPI',
+  PPI_REVIEW: 'PPI_REVIEW',
+  PPI_HISTORY: 'PPI_HISTORY',
+  AUDIT: 'AUDIT_LOG',
+  NOTIFICATION_LOG: 'NOTIFICATION_LOG'
+};
+
+function doGet() {
+  return HtmlService
+    .createHtmlOutputFromFile('Index')
+    .setTitle('Si-Asesmen MBK');
+}
+
+function setupDatabase() {
+  const ss = getDb_();
+  const userHeaders = ['ID','USERNAME','PASSWORD_HASH','NAMA','ROLE','STATUS','CREATED_AT','UPDATED_AT','EMAIL'];
+  const studentHeaders = ['ID','NAMA','NISN','KELAS','TTL','JK','AGAMA','ORTU','PEKERJAAN','HP','ALAMAT','USIA_HAMIL','KONDISI_LAHIR','RIWAYAT_KEHAMILAN','ASESMEN_JSON','INDIKASI_UTAMA','STATUS_PPI','CREATED_AT','UPDATED_AT','CREATED_BY','UPDATED_BY'];
+  const journalHeaders = ['ID','STUDENT_ID','TANGGAL','MAPEL','KEGIATAN','OBSERVASI','PROGRES','RENCANA_TINDAK_LANJUT','CREATED_BY','CREATED_AT','UPDATED_BY','UPDATED_AT'];
+  const ppiHeaders = ['ID','STUDENT_ID','CATEGORY_ID','CATEGORY_TITLE','NEED','GOALS_JSON','STRATEGIES_JSON','SUCCESS_INDICATORS','ACCOMMODATIONS','FREQUENCY','PERIOD','RESPONSIBLE','NOTES','STATUS','APPROVED_BY','APPROVED_AT','CREATED_BY','CREATED_AT','UPDATED_AT','NEXT_REVIEW_DATE'];
+  const reviewHeaders = ['ID','STUDENT_ID','PPI_ID','CATEGORY_ID','CATEGORY_TITLE','GOAL_INDEX','GOAL_TEXT','REVIEW_DATE','TARGET','ACHIEVEMENT','STATUS','EVIDENCE','FOLLOW_UP','REVIEWED_BY','CREATED_AT','UPDATED_AT'];
+  const historyHeaders = ['ID','STUDENT_ID','VERSION','STATUS','SNAPSHOT_JSON','CHANGED_BY','CHANGED_AT','REASON'];
+  const auditHeaders = ['TIMESTAMP','USER_ID','USERNAME','ACTION','TARGET_TYPE','TARGET_ID','DESCRIPTION'];
+  const notificationHeaders = ['ID','SENT_AT','RECIPIENT','TYPE','DATE_KEY','SUBJECT','STATUS','DETAILS'];
+
+  ensureSheet_(ss, SHEETS.USERS, userHeaders);
+  ensureSheet_(ss, SHEETS.STUDENTS, studentHeaders);
+  ensureSheet_(ss, SHEETS.JOURNAL, journalHeaders);
+  ensureSheet_(ss, SHEETS.PPI, ppiHeaders);
+  ensureSheet_(ss, SHEETS.PPI_REVIEW, reviewHeaders);
+  ensureSheet_(ss, SHEETS.PPI_HISTORY, historyHeaders);
+  ensureSheet_(ss, SHEETS.AUDIT, auditHeaders);
+  ensureSheet_(ss, SHEETS.NOTIFICATION_LOG, notificationHeaders);
+
+  const userSheet = ss.getSheetByName(SHEETS.USERS);
+  if (userSheet.getLastRow() < 2) {
+    const now = new Date();
+    userSheet.appendRow([
+      Utilities.getUuid(),
+      CONFIG.DEFAULT_ADMIN_USERNAME,
+      hashPassword_(CONFIG.DEFAULT_ADMIN_PASSWORD),
+      'Administrator',
+      'GPK',
+      'AKTIF',
+      now,
+      now,
+      ''
+    ]);
+  }
+
+  return {
+    ok: true,
+    spreadsheetId: ss.getId(),
+    message: 'Database siap. Akun awal: ' + CONFIG.DEFAULT_ADMIN_USERNAME + ' / ' + CONFIG.DEFAULT_ADMIN_PASSWORD
+  };
+}
+
+function getDb_() {
+  const props = PropertiesService.getScriptProperties();
+  const configuredId = props.getProperty('SPREADSHEET_ID');
+  if (configuredId) return SpreadsheetApp.openById(configuredId);
+
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (!active) {
+    throw new Error('SPREADSHEET_ID belum dikonfigurasi. Jalankan setupDatabase dari project yang terikat ke Google Sheet.');
+  }
+  props.setProperty('SPREADSHEET_ID', active.getId());
+  return active;
+}
+
+function ensureSheet_(ss, name, headers) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  const currentHeaders = sheet.getLastRow() > 0 ? sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), headers.length)).getValues()[0] : [];
+  let needsHeaders = sheet.getLastRow() === 0 || currentHeaders.slice(0, headers.length).join('\u0001') !== headers.join('\u0001');
+  if (needsHeaders) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  } else if (sheet.getFrozenRows() === 0) {
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function hashPassword_(password) {
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(password),
+    Utilities.Charset.UTF_8
+  );
+  return Utilities.base64Encode(digest);
+}
+
+function normalizeUsername_(username) {
+  return String(username || '').trim().toLowerCase();
+}
+
+function normalizeEmail_(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function isValidEmail_(email) {
+  if (!email) return true;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function login(username, password) {
+  setupDatabase();
+  const sheet = getDb_().getSheetByName(SHEETS.USERS);
+  const rows = sheet.getDataRange().getValues();
+  const target = normalizeUsername_(username);
+  const hash = hashPassword_(password || '');
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (normalizeUsername_(r[1]) === target && String(r[2]) === hash) {
+      if (String(r[5]).toUpperCase() !== 'AKTIF') {
+        return {ok: false, message: 'Akun tidak aktif.'};
+      }
+
+      const user = {
+        id: String(r[0]),
+        username: String(r[1]),
+        name: String(r[3]),
+        role: String(r[4])
+      };
+      const token = Utilities.getUuid();
+      CacheService.getScriptCache().put('SESSION_' + token, JSON.stringify(user), CONFIG.SESSION_CACHE_SECONDS);
+      writeAudit_(user, 'LOGIN', 'SESSION', '', 'Login berhasil');
+      return {ok: true, token: token, user: user};
+    }
+  }
+
+  return {ok: false, message: 'Username atau kata sandi salah.'};
+}
+
+function validateSession(token) {
+  const user = getSession_(token);
+  return user ? {ok: true, user: user} : {ok: false};
+}
+
+function logout(token) {
+  const user = getSession_(token);
+  if (user) writeAudit_(user, 'LOGOUT', 'SESSION', '', 'Logout');
+  if (token) CacheService.getScriptCache().remove('SESSION_' + token);
+  return {ok: true};
+}
+
+function getSession_(token) {
+  if (!token) return null;
+  const raw = CacheService.getScriptCache().get('SESSION_' + token);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function requireSession_(token, roles) {
+  const user = getSession_(token);
+  if (!user) throw new Error('Sesi Anda telah berakhir. Silakan login kembali.');
+  if (roles && roles.length && roles.indexOf(user.role) === -1) {
+    throw new Error('Anda tidak memiliki hak akses untuk tindakan ini.');
+  }
+  return user;
+}
+
+function getStudents(token) {
+  const user = requireSession_(token);
+  const students = readStudents_();
+  writeAudit_(user, 'READ', 'STUDENTS', '', 'Memuat daftar murid');
+  return students;
+}
+
+function readStudents_() {
+  const sheet = getDb_().getSheetByName(SHEETS.STUDENTS);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const values = sheet.getDataRange().getValues();
+  return values.slice(1).map(rowToStudent_);
+}
+
+function rowToStudent_(r) {
+  let asesmen = {};
+  try { asesmen = r[14] ? JSON.parse(r[14]) : {}; } catch (e) {}
+  return {
+    id: String(r[0] || ''),
+    nama: String(r[1] || ''),
+    nisn: String(r[2] || ''),
+    kelas: String(r[3] || ''),
+    ttl: String(r[4] || ''),
+    jk: String(r[5] || ''),
+    agama: String(r[6] || ''),
+    ortu: String(r[7] || ''),
+    pekerjaan: String(r[8] || ''),
+    hp: String(r[9] || ''),
+    alamat: String(r[10] || ''),
+    usiaHamil: String(r[11] || ''),
+    kondisiLahir: String(r[12] || ''),
+    riwayatKehamilan: String(r[13] || ''),
+    asesmen: asesmen,
+    indikasiUtama: String(r[15] || 'Belum Diasesmen'),
+    statusPPI: String(r[16] || 'Belum Disetujui'),
+    createdAt: r[17] ? new Date(r[17]).toISOString() : '',
+    updatedAt: r[18] ? new Date(r[18]).toISOString() : ''
+  };
+}
+
+function saveStudent(token, data) {
+  const user = requireSession_(token, ['GPK','BK']);
+  if (!data || !String(data.nama || '').trim() || !String(data.nisn || '').trim() || !String(data.kelas || '').trim()) {
+    throw new Error('Nama, NISN, dan kelas wajib diisi.');
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const ss = getDb_();
+    const sheet = ss.getSheetByName(SHEETS.STUDENTS);
+    const values = sheet.getDataRange().getValues();
+    const now = new Date();
+    let rowNumber = -1;
+    let existing = null;
+
+    if (data.id) {
+      for (let i = 1; i < values.length; i++) {
+        if (String(values[i][0]) === String(data.id)) {
+          rowNumber = i + 1;
+          existing = rowToStudent_(values[i]);
+          break;
+        }
+      }
+    }
+
+    // NISN tidak boleh ganda.
+    for (let i = 1; i < values.length; i++) {
+      if (rowNumber === i + 1) continue;
+      if (String(values[i][2]).trim() === String(data.nisn).trim()) {
+        throw new Error('NISN sudah digunakan oleh murid lain.');
+      }
+    }
+
+    const student = Object.assign({
+      id: '',
+      asesmen: {},
+      indikasiUtama: 'Belum Diasesmen',
+      statusPPI: 'Belum Disetujui'
+    }, existing || {}, data);
+    if (!String(student.id || '').trim()) student.id = Utilities.getUuid();
+
+    const row = [
+      student.id,
+      String(student.nama || '').trim(),
+      String(student.nisn || '').trim(),
+      String(student.kelas || '').trim(),
+      String(student.ttl || '').trim(),
+      String(student.jk || ''),
+      String(student.agama || '').trim(),
+      String(student.ortu || '').trim(),
+      String(student.pekerjaan || '').trim(),
+      String(student.hp || '').trim(),
+      String(student.alamat || '').trim(),
+      String(student.usiaHamil || '').trim(),
+      String(student.kondisiLahir || ''),
+      String(student.riwayatKehamilan || '').trim(),
+      JSON.stringify(student.asesmen || {}),
+      String(student.indikasiUtama || 'Belum Diasesmen'),
+      String(student.statusPPI || 'Belum Disetujui'),
+      existing ? (values[rowNumber - 1][17] || now) : now,
+      now,
+      existing ? String(values[rowNumber - 1][19] || user.id) : user.id,
+      user.id
+    ];
+
+    if (rowNumber > 0) {
+      sheet.getRange(rowNumber, 1, 1, row.length).setValues([row]);
+      writeAudit_(user, 'UPDATE', 'STUDENT', student.id, 'Memperbarui data murid ' + student.nisn);
+    } else {
+      sheet.appendRow(row);
+      writeAudit_(user, 'CREATE', 'STUDENT', student.id, 'Menambahkan murid ' + student.nisn);
+    }
+
+    return {ok: true, students: readStudents_()};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+
+function clearPPIMatrixForStudent_(studentId) {
+  const sheet = getDb_().getSheetByName(SHEETS.PPI);
+  if (sheet && sheet.getLastRow() >= 2) {
+    const values = sheet.getDataRange().getValues();
+    for (let i = values.length - 1; i >= 1; i--) {
+      if (String(values[i][1]) === String(studentId)) sheet.deleteRow(i + 1);
+    }
+  }
+  const reviewSheet = getDb_().getSheetByName(SHEETS.PPI_REVIEW);
+  if (reviewSheet && reviewSheet.getLastRow() >= 2) {
+    const values = reviewSheet.getDataRange().getValues();
+    for (let i = values.length - 1; i >= 1; i--) {
+      if (String(values[i][1]) === String(studentId)) reviewSheet.deleteRow(i + 1);
+    }
+  }
+}
+
+// ==============================
+// PPI MATRIX
+// ==============================
+function getPPIMatrix(token, studentId) {
+  const user = requireSession_(token);
+  if (!studentId) return [];
+  const students = readStudents_();
+  if (!students.some(s => String(s.id) === String(studentId))) {
+    throw new Error('Data murid tidak ditemukan.');
+  }
+  const entries = getPPIMatrixWithoutAudit_(studentId);
+  writeAudit_(user, 'READ', 'PPI', studentId, 'Memuat matriks PPI murid');
+  return entries;
+}
+
+function rowToPPI_(r) {
+  let goals = [];
+  let strategies = [];
+  try { goals = r[5] ? JSON.parse(r[5]) : []; } catch (e) {}
+  try { strategies = r[6] ? JSON.parse(r[6]) : []; } catch (e) {}
+  return {
+    id: String(r[0] || ''),
+    studentId: String(r[1] || ''),
+    categoryId: String(r[2] || ''),
+    categoryTitle: String(r[3] || ''),
+    need: String(r[4] || ''),
+    goals: Array.isArray(goals) ? goals : [],
+    strategies: Array.isArray(strategies) ? strategies : [],
+    successIndicators: String(r[7] || ''),
+    accommodations: String(r[8] || ''),
+    frequency: String(r[9] || ''),
+    period: String(r[10] || ''),
+    responsible: String(r[11] || ''),
+    notes: String(r[12] || ''),
+    status: String(r[13] || 'Draft'),
+    approvedBy: String(r[14] || ''),
+    approvedAt: r[15] ? new Date(r[15]).toISOString() : '',
+    createdBy: String(r[16] || ''),
+    createdAt: r[17] ? new Date(r[17]).toISOString() : '',
+    updatedAt: r[18] ? new Date(r[18]).toISOString() : '',
+    nextReviewDate: String(r[19] || '')
+  };
+}
+
+function getPPIMatrixWithoutAudit_(studentId) {
+  const sheet = getDb_().getSheetByName(SHEETS.PPI);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getDataRange().getValues()
+    .slice(1)
+    .filter(r => String(r[1]) === String(studentId))
+    .map(rowToPPI_)
+    .sort((a, b) => String(a.categoryTitle).localeCompare(String(b.categoryTitle)));
+}
+
+function normalizePPIItems_(items) {
+  if (!Array.isArray(items)) throw new Error('Format matriks PPI tidak valid.');
+  return items.map(function(item) {
+    return {
+      id: String(item.id || ''),
+      studentId: String(item.studentId || ''),
+      categoryId: String(item.categoryId || ''),
+      categoryTitle: String(item.categoryTitle || '').trim(),
+      need: String(item.need || '').trim(),
+      goals: Array.isArray(item.goals) ? item.goals.map(x => String(x || '').trim()).filter(Boolean) : [],
+      strategies: Array.isArray(item.strategies) ? item.strategies.map(x => String(x || '').trim()).filter(Boolean) : [],
+      successIndicators: String(item.successIndicators || '').trim(),
+      accommodations: String(item.accommodations || '').trim(),
+      frequency: String(item.frequency || '').trim(),
+      period: String(item.period || '').trim(),
+      responsible: String(item.responsible || '').trim(),
+      notes: String(item.notes || '').trim(),
+      nextReviewDate: String(item.nextReviewDate || '').trim()
+    };
+  }).filter(item => item.categoryId || item.categoryTitle);
+}
+
+function savePPIHistorySnapshot_(studentId, items, status, user, reason) {
+  if (!items || !items.length) return;
+  const sheet = getDb_().getSheetByName(SHEETS.PPI_HISTORY);
+  if (!sheet) return;
+  const version = new Date().toISOString();
+  sheet.appendRow([
+    Utilities.getUuid(),
+    String(studentId),
+    version,
+    status || 'Draft',
+    JSON.stringify(items),
+    user ? user.username : '',
+    new Date(),
+    reason || ''
+  ]);
+}
+
+function getPPIHistoryWithoutAudit_(studentId) {
+  const sheet = getDb_().getSheetByName(SHEETS.PPI_HISTORY);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getDataRange().getValues().slice(1).filter(r => String(r[1]) === String(studentId)).map(function(r) {
+    let snapshot = [];
+    try { snapshot = r[4] ? JSON.parse(r[4]) : []; } catch (e) {}
+    return {
+      id: String(r[0] || ''),
+      studentId: String(r[1] || ''),
+      version: String(r[2] || ''),
+      status: String(r[3] || ''),
+      snapshot: Array.isArray(snapshot) ? snapshot : [],
+      changedBy: String(r[5] || ''),
+      changedAt: r[6] ? new Date(r[6]).toISOString() : '',
+      reason: String(r[7] || '')
+    };
+  }).sort((a,b) => String(b.changedAt).localeCompare(String(a.changedAt)));
+}
+
+function getPPIHistory(token, studentId) {
+  const user = requireSession_(token);
+  if (!studentId) return [];
+  const result = getPPIHistoryWithoutAudit_(studentId);
+  writeAudit_(user, 'READ', 'PPI_HISTORY', studentId, 'Memuat histori versi PPI');
+  return result;
+}
+
+function writePPIMatrix_(studentId, items, user, status, approval) {
+  const sheet = getDb_().getSheetByName(SHEETS.PPI);
+  const now = new Date();
+  const existing = getPPIMatrixWithoutAudit_(studentId);
+  const existingByCategory = {};
+  existing.forEach(x => existingByCategory[x.categoryId] = x);
+
+  // Replace the matrix for this student as one logical transaction.
+  const values = sheet.getDataRange().getValues();
+  for (let i = values.length - 1; i >= 1; i--) {
+    if (String(values[i][1]) === String(studentId)) {
+      sheet.deleteRow(i + 1);
+    }
+  }
+
+  const rows = items.map(function(item) {
+    const old = existingByCategory[item.categoryId] || {};
+    return [
+      item.id || Utilities.getUuid(),
+      String(studentId),
+      item.categoryId,
+      item.categoryTitle,
+      item.need,
+      JSON.stringify(item.goals || []),
+      JSON.stringify(item.strategies || []),
+      item.successIndicators,
+      item.accommodations,
+      item.frequency,
+      item.period,
+      item.responsible,
+      item.notes,
+      status || 'Draft',
+      approval && approval.approvedBy ? approval.approvedBy : '',
+      approval && approval.approvedAt ? approval.approvedAt : '',
+      old.createdBy || user.username,
+      old.createdAt || now,
+      now,
+      item.nextReviewDate || ''
+    ];
+  });
+
+  if (rows.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  return getPPIMatrixWithoutAudit_(studentId);
+}
+
+function setStudentPPIStatus_(studentId, status, user) {
+  const sheet = getDb_().getSheetByName(SHEETS.STUDENTS);
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(studentId)) {
+      const row = i + 1;
+      sheet.getRange(row, 17).setValue(status);
+      sheet.getRange(row, 19).setValue(new Date());
+      sheet.getRange(row, 21).setValue(user.id);
+      return;
+    }
+  }
+  throw new Error('Data murid tidak ditemukan.');
+}
+
+function savePPIMatrix(token, studentId, items) {
+  const user = requireSession_(token, ['GPK','BK']);
+  if (!studentId) throw new Error('Murid wajib dipilih.');
+
+  const students = readStudents_();
+  if (!students.some(s => String(s.id) === String(studentId))) {
+    throw new Error('Data murid tidak ditemukan.');
+  }
+
+  const normalized = normalizePPIItems_(items).map(function(item) {
+    item.studentId = String(studentId);
+    if (!item.categoryTitle) item.categoryTitle = item.categoryId;
+    return item;
+  });
+
+  if (!normalized.length) throw new Error('Matriks PPI belum memiliki item.');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const existingBefore = getPPIMatrixWithoutAudit_(studentId);
+    if (existingBefore.length && existingBefore.some(x => String(x.status).toLowerCase() === 'disetujui')) {
+      savePPIHistorySnapshot_(studentId, existingBefore, 'Disetujui', user, 'Revisi PPI setelah persetujuan');
+    }
+    const saved = writePPIMatrix_(studentId, normalized, user, 'Draft', null);
+    setStudentPPIStatus_(studentId, 'Draft', user);
+    writeAudit_(user, 'SAVE', 'PPI', studentId, 'Menyimpan draft matriks PPI');
+    return {ok: true, matrix: saved, students: readStudents_()};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function approvePPI(token, studentId, items) {
+  const user = requireSession_(token, ['GPK']);
+  if (!studentId) throw new Error('Murid wajib dipilih.');
+
+  const students = readStudents_();
+  const student = students.find(s => String(s.id) === String(studentId));
+  if (!student) throw new Error('Data murid tidak ditemukan.');
+  if (!student.asesmen || !Object.keys(student.asesmen).length) {
+    throw new Error('Asesmen belum tersedia. Lakukan asesmen terlebih dahulu.');
+  }
+
+  let normalized = normalizePPIItems_(items);
+  if (!normalized.length) normalized = getPPIMatrixWithoutAudit_(studentId);
+  if (!normalized.length) throw new Error('Matriks PPI belum tersedia.');
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const existingBefore = getPPIMatrixWithoutAudit_(studentId);
+    if (existingBefore.length) {
+      savePPIHistorySnapshot_(studentId, existingBefore, existingBefore[0].status || 'Draft', user, 'Versi sebelum persetujuan PPI');
+    }
+    const approvedAt = new Date();
+    const saved = writePPIMatrix_(studentId, normalized, user, 'Disetujui', {
+      approvedBy: user.username,
+      approvedAt: approvedAt
+    });
+    setStudentPPIStatus_(studentId, 'Disetujui', user);
+    writeAudit_(user, 'APPROVE', 'PPI', studentId, 'Menyetujui matriks PPI');
+    return {ok: true, matrix: saved, students: readStudents_()};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function deleteRelatedRows_(sheetName, columnIndexZeroBased, targetId) {
+  const sheet = getDb_().getSheetByName(sheetName);
+  if (!sheet || sheet.getLastRow() < 2) return;
+  const values = sheet.getDataRange().getValues();
+  for (let i = values.length - 1; i >= 1; i--) {
+    if (String(values[i][columnIndexZeroBased]) === String(targetId)) {
+      sheet.deleteRow(i + 1);
+    }
+  }
+}
+
+function deleteStudent(token, studentId) {
+  const user = requireSession_(token, ['GPK']);
+  const sheet = getDb_().getSheetByName(SHEETS.STUDENTS);
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(studentId)) {
+      sheet.deleteRow(i + 1);
+      deleteRelatedRows_(SHEETS.JOURNAL, 1, studentId);
+      deleteRelatedRows_(SHEETS.PPI, 1, studentId);
+      deleteRelatedRows_(SHEETS.PPI_REVIEW, 1, studentId);
+      writeAudit_(user, 'DELETE', 'STUDENT', studentId, 'Menghapus data murid beserta jurnal dan PPI terkait');
+      return {ok: true, students: readStudents_()};
+    }
+  }
+  throw new Error('Data murid tidak ditemukan.');
+}
+
+function saveAssessment(token, studentId, asesmen, indikasiUtama) {
+  const user = requireSession_(token, ['GPK','BK']);
+  const sheet = getDb_().getSheetByName(SHEETS.STUDENTS);
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(studentId)) {
+      const row = i + 1;
+      sheet.getRange(row, 15).setValue(JSON.stringify(asesmen || {}));
+      sheet.getRange(row, 16).setValue(indikasiUtama || 'Tidak Terindikasi');
+      sheet.getRange(row, 17).setValue('Belum Disetujui');
+      sheet.getRange(row, 19).setValue(new Date());
+      sheet.getRange(row, 21).setValue(user.id);
+      const existingPPI = getPPIMatrixWithoutAudit_(studentId);
+      if (existingPPI.length) savePPIHistorySnapshot_(studentId, existingPPI, existingPPI[0].status || 'Draft', user, 'Asesmen diubah; PPI lama diarsipkan');
+      clearPPIMatrixForStudent_(studentId);
+      deleteRelatedRows_(SHEETS.PPI_REVIEW, 1, studentId);
+      writeAudit_(user, 'ASSESSMENT', 'STUDENT', studentId, 'Menyimpan hasil asesmen dan mengarsipkan PPI lama: ' + (indikasiUtama || 'Tidak Terindikasi'));
+      return {ok: true, students: readStudents_()};
+    }
+  }
+  throw new Error('Data murid tidak ditemukan.');
+}
+
+
+// ==============================
+// JOURNAL PERKEMBANGAN
+// ==============================
+function rowToJournal_(r) {
+  return {
+    id: String(r[0] || ''),
+    studentId: String(r[1] || ''),
+    tanggal: r[2] instanceof Date ? Utilities.formatDate(r[2], Session.getScriptTimeZone(), 'yyyy-MM-dd') : String(r[2] || ''),
+    mapel: String(r[3] || ''),
+    kegiatan: String(r[4] || ''),
+    observasi: String(r[5] || ''),
+    progres: String(r[6] || 'Belum Terlihat'),
+    rencanaTindakLanjut: String(r[7] || ''),
+    createdBy: String(r[8] || ''),
+    createdAt: r[9] ? new Date(r[9]).toISOString() : '',
+    updatedBy: String(r[10] || ''),
+    updatedAt: r[11] ? new Date(r[11]).toISOString() : ''
+  };
+}
+
+function getJournalEntriesWithoutAudit_(studentId) {
+  const sheet = getDb_().getSheetByName(SHEETS.JOURNAL);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getDataRange().getValues().slice(1)
+    .filter(r => String(r[1]) === String(studentId))
+    .map(rowToJournal_)
+    .sort((a,b) => String(b.tanggal).localeCompare(String(a.tanggal)) || String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+function getJournalEntries(token, studentId) {
+  const user = requireSession_(token);
+  if (!studentId) return [];
+  if (!readStudents_().some(s => String(s.id) === String(studentId))) throw new Error('Data murid tidak ditemukan.');
+  const result = getJournalEntriesWithoutAudit_(studentId);
+  writeAudit_(user, 'READ', 'JOURNAL', studentId, 'Memuat jurnal perkembangan murid');
+  return result;
+}
+
+function saveJournalEntry(token, data) {
+  const user = requireSession_(token, ['GPK','BK','MAPEL']);
+  data = data || {};
+  const studentId = String(data.studentId || '');
+  if (!studentId) throw new Error('Murid wajib dipilih.');
+  if (!String(data.tanggal || '').trim()) throw new Error('Tanggal jurnal wajib diisi.');
+  if (!String(data.kegiatan || '').trim()) throw new Error('Kegiatan pembelajaran wajib diisi.');
+  if (!readStudents_().some(s => String(s.id) === studentId)) throw new Error('Data murid tidak ditemukan.');
+
+  const allowedProgress = ['Belum Terlihat','Mulai Berkembang','Berkembang','Berkembang Baik','Mandiri'];
+  const progres = allowedProgress.indexOf(String(data.progres || '')) >= 0 ? String(data.progres) : 'Belum Terlihat';
+  const sheet = getDb_().getSheetByName(SHEETS.JOURNAL);
+  const values = sheet.getDataRange().getValues();
+  const now = new Date();
+  let rowNumber = -1;
+  let existing = null;
+
+  for (let i=1; i<values.length; i++) {
+    if (String(values[i][0]) === String(data.id || '')) {
+      rowNumber = i + 1;
+      existing = values[i];
+      break;
+    }
+  }
+  if (data.id && rowNumber < 0) throw new Error('Catatan jurnal tidak ditemukan.');
+
+  const id = data.id || Utilities.getUuid();
+  const createdBy = existing ? String(existing[8] || user.username) : user.username;
+  const createdAt = existing ? (existing[9] || now) : now;
+  const row = [
+    id, studentId, String(data.tanggal).trim(), String(data.mapel || '').trim(),
+    String(data.kegiatan || '').trim(), String(data.observasi || '').trim(), progres,
+    String(data.rencanaTindakLanjut || '').trim(), createdBy, createdAt, user.username, now
+  ];
+
+  if (rowNumber > 0) {
+    sheet.getRange(rowNumber, 1, 1, row.length).setValues([row]);
+    writeAudit_(user, 'UPDATE', 'JOURNAL', id, 'Memperbarui jurnal perkembangan');
+  } else {
+    sheet.appendRow(row);
+    writeAudit_(user, 'CREATE', 'JOURNAL', id, 'Menambahkan jurnal perkembangan');
+  }
+  return {ok:true, entries:getJournalEntriesWithoutAudit_(studentId)};
+}
+
+function deleteJournalEntry(token, journalId) {
+  const user = requireSession_(token, ['GPK','BK','MAPEL']);
+  const sheet = getDb_().getSheetByName(SHEETS.JOURNAL);
+  if (!sheet || sheet.getLastRow() < 2) throw new Error('Catatan jurnal tidak ditemukan.');
+  const values = sheet.getDataRange().getValues();
+  for (let i=1; i<values.length; i++) {
+    if (String(values[i][0]) === String(journalId)) {
+      const studentId = String(values[i][1]);
+      sheet.deleteRow(i+1);
+      writeAudit_(user, 'DELETE', 'JOURNAL', journalId, 'Menghapus jurnal perkembangan');
+      return {ok:true, entries:getJournalEntriesWithoutAudit_(studentId)};
+    }
+  }
+  throw new Error('Catatan jurnal tidak ditemukan.');
+}
+
+// ==============================
+// PPI MONITORING / REVIEW
+// ==============================
+function rowToPPIReview_(r) {
+  return {
+    id: String(r[0] || ''),
+    studentId: String(r[1] || ''),
+    ppiId: String(r[2] || ''),
+    categoryId: String(r[3] || ''),
+    categoryTitle: String(r[4] || ''),
+    goalIndex: Number(r[5] || 0),
+    goalText: String(r[6] || ''),
+    reviewDate: r[7] instanceof Date ? Utilities.formatDate(r[7], Session.getScriptTimeZone(), 'yyyy-MM-dd') : String(r[7] || ''),
+    target: String(r[8] || ''),
+    achievement: String(r[9] || ''),
+    status: String(r[10] || 'Belum Dievaluasi'),
+    evidence: String(r[11] || ''),
+    followUp: String(r[12] || ''),
+    reviewedBy: String(r[13] || ''),
+    createdAt: r[14] ? new Date(r[14]).toISOString() : '',
+    updatedAt: r[15] ? new Date(r[15]).toISOString() : ''
+  };
+}
+
+function getPPIReviewsWithoutAudit_(studentId) {
+  const sheet = getDb_().getSheetByName(SHEETS.PPI_REVIEW);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getDataRange().getValues().slice(1)
+    .filter(r => String(r[1]) === String(studentId))
+    .map(rowToPPIReview_)
+    .sort((a,b) => String(b.reviewDate).localeCompare(String(a.reviewDate)) || String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+function getPPIReviews(token, studentId) {
+  const user = requireSession_(token);
+  if (!studentId) return [];
+  if (!readStudents_().some(s => String(s.id) === String(studentId))) throw new Error('Data murid tidak ditemukan.');
+  const result = getPPIReviewsWithoutAudit_(studentId);
+  writeAudit_(user, 'READ', 'PPI_REVIEW', studentId, 'Memuat evaluasi perkembangan PPI');
+  return result;
+}
+
+function savePPIReview(token, data) {
+  const user = requireSession_(token, ['GPK','BK']);
+  data = data || {};
+  const studentId = String(data.studentId || '');
+  if (!studentId) throw new Error('Murid wajib dipilih.');
+  if (!String(data.reviewDate || '').trim()) throw new Error('Tanggal review wajib diisi.');
+  if (!String(data.categoryId || '').trim()) throw new Error('Kategori PPI wajib dipilih.');
+  if (!String(data.goalText || '').trim()) throw new Error('Tujuan PPI wajib dipilih.');
+  const allowed = ['Belum Dievaluasi','Belum Tercapai','Sebagian Tercapai','Tercapai','Melampaui Target'];
+  const status = allowed.indexOf(String(data.status || '')) >= 0 ? String(data.status) : 'Belum Dievaluasi';
+  const ppi = getPPIMatrixWithoutAudit_(studentId);
+  const ppiItem = ppi.find(x => String(x.id) === String(data.ppiId)) || ppi.find(x => String(x.categoryId) === String(data.categoryId));
+  if (!ppiItem) throw new Error('Matriks PPI untuk kategori tersebut belum tersedia.');
+
+  const sheet = getDb_().getSheetByName(SHEETS.PPI_REVIEW);
+  const values = sheet.getDataRange().getValues();
+  const now = new Date();
+  let rowNumber = -1, existing = null;
+  for (let i=1;i<values.length;i++) {
+    if (String(values[i][0]) === String(data.id || '')) { rowNumber=i+1; existing=values[i]; break; }
+  }
+  if (data.id && rowNumber < 0) throw new Error('Evaluasi PPI tidak ditemukan.');
+  const id = data.id || Utilities.getUuid();
+  const createdAt = existing ? (existing[14] || now) : now;
+  const row = [
+    id, studentId, ppiItem.id, ppiItem.categoryId, ppiItem.categoryTitle, Number(data.goalIndex || 0), String(data.goalText || '').trim(),
+    String(data.reviewDate).trim(), String(data.target || '').trim(), String(data.achievement || '').trim(), status,
+    String(data.evidence || '').trim(), String(data.followUp || '').trim(), user.username, createdAt, now
+  ];
+  if (rowNumber > 0) {
+    sheet.getRange(rowNumber,1,1,row.length).setValues([row]);
+    writeAudit_(user,'UPDATE','PPI_REVIEW',id,'Memperbarui evaluasi PPI');
+  } else {
+    sheet.appendRow(row);
+    writeAudit_(user,'CREATE','PPI_REVIEW',id,'Menambahkan evaluasi PPI');
+  }
+  return {ok:true, reviews:getPPIReviewsWithoutAudit_(studentId)};
+}
+
+function deletePPIReview(token, reviewId) {
+  const user = requireSession_(token, ['GPK','BK']);
+  const sheet = getDb_().getSheetByName(SHEETS.PPI_REVIEW);
+  if (!sheet || sheet.getLastRow() < 2) throw new Error('Evaluasi PPI tidak ditemukan.');
+  const values = sheet.getDataRange().getValues();
+  for (let i=1;i<values.length;i++) {
+    if (String(values[i][0]) === String(reviewId)) {
+      const studentId = String(values[i][1]);
+      sheet.deleteRow(i+1);
+      writeAudit_(user,'DELETE','PPI_REVIEW',reviewId,'Menghapus evaluasi PPI');
+      return {ok:true, reviews:getPPIReviewsWithoutAudit_(studentId)};
+    }
+  }
+  throw new Error('Evaluasi PPI tidak ditemukan.');
+}
+
+// ==============================
+// LAPORAN INDIVIDUAL
+// ==============================
+function getStudentReport(token, studentId) {
+  const user = requireSession_(token);
+  const student = readStudents_().find(s => String(s.id) === String(studentId));
+  if (!student) throw new Error('Data murid tidak ditemukan.');
+  const ppi = getPPIMatrixWithoutAudit_(studentId);
+  const journals = getJournalEntriesWithoutAudit_(studentId);
+  const reviews = getPPIReviewsWithoutAudit_(studentId);
+  const history = getPPIHistoryWithoutAudit_(studentId);
+  writeAudit_(user, 'READ', 'REPORT', studentId, 'Memuat laporan individual murid');
+  return {student:student, ppi:ppi, journals:journals, reviews:reviews, ppiHistory:history};
+}
+
+// ==============================
+// DASHBOARD
+// ==============================
+function getDashboardStats(token) {
+  const user = requireSession_(token);
+  const students = readStudents_();
+  const auditSheet = getDb_().getSheetByName(SHEETS.AUDIT);
+  const logCount = auditSheet && auditSheet.getLastRow() > 1 ? auditSheet.getLastRow() - 1 : 0;
+  return {
+    totalMurid: students.length,
+    terasesmen: students.filter(s => s.indikasiUtama && s.indikasiUtama !== 'Belum Diasesmen' && s.indikasiUtama !== 'Belum Ada Indikasi').length,
+    ppi: students.filter(s => String(s.statusPPI).toLowerCase() === 'disetujui').length,
+    log: logCount,
+    role: user.role
+  };
+}
+
+
+function buildPPIMonitoringDashboard_() {
+  const students = readStudents_();
+  const studentById = {};
+  students.forEach(function(s) { studentById[String(s.id)] = s; });
+
+  const ppiSheet = getDb_().getSheetByName(SHEETS.PPI);
+  const ppiRows = (ppiSheet && ppiSheet.getLastRow() >= 2) ? ppiSheet.getDataRange().getValues().slice(1).map(rowToPPI_) : [];
+  const reviewSheet = getDb_().getSheetByName(SHEETS.PPI_REVIEW);
+  const reviewRows = (reviewSheet && reviewSheet.getLastRow() >= 2) ? reviewSheet.getDataRange().getValues().slice(1).map(rowToPPIReview_) : [];
+
+  const today = new Date();
+  const todayKey = Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const soonDate = new Date(today);
+  soonDate.setDate(soonDate.getDate() + 7);
+  const soonKey = Utilities.formatDate(soonDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  // Ambil evaluasi terakhir untuk kombinasi PPI + tujuan.
+  const latestReview = {};
+  reviewRows.forEach(function(r) {
+    const key = String(r.ppiId || '') + '|' + String(r.goalIndex || 0);
+    const old = latestReview[key];
+    const scoreNew = String(r.reviewDate || '') + '|' + String(r.updatedAt || '');
+    const scoreOld = old ? String(old.reviewDate || '') + '|' + String(old.updatedAt || '') : '';
+    if (!old || scoreNew > scoreOld) latestReview[key] = r;
+  });
+
+  let overdue = 0;
+  let dueSoon = 0;
+  let dueToday = 0;
+  let targetNotAchieved = 0;
+  let activePPI = 0;
+  const ppiStudentIds = {};
+  ppiRows.forEach(function(p) { ppiStudentIds[String(p.studentId)] = true; });
+  const pendingApprovalStudents = students.filter(function(s) {
+    return !!ppiStudentIds[String(s.id)] && String(s.statusPPI || '').toLowerCase() !== 'disetujui';
+  }).length;
+
+  const followMap = {};
+  const monitoringRows = [];
+
+  ppiRows.forEach(function(p) {
+    const student = studentById[String(p.studentId)];
+    if (!student) return;
+    activePPI++;
+    const statusPPI = String(student.statusPPI || p.status || 'Draft');
+    const reviewDate = String(p.nextReviewDate || '').trim();
+    let priority = 9;
+    let priorityLabel = 'Normal';
+    let issue = '';
+    let daysOffset = null;
+
+    if (reviewDate) {
+      const reviewDt = new Date(reviewDate + 'T00:00:00');
+      const todayDt = new Date(todayKey + 'T00:00:00');
+      const diff = Math.round((reviewDt.getTime() - todayDt.getTime()) / 86400000);
+      daysOffset = diff;
+      if (reviewDate < todayKey) {
+        overdue++;
+        priority = 1;
+        priorityLabel = 'Terlambat';
+        issue = 'Review PPI melewati tanggal review.';
+      } else if (reviewDate === todayKey) {
+        dueToday++;
+        priority = 2;
+        priorityLabel = 'Review Hari Ini';
+        issue = 'Review PPI dijadwalkan hari ini.';
+      } else if (reviewDate <= soonKey) {
+        dueSoon++;
+        priority = 3;
+        priorityLabel = 'Segera Review';
+        issue = 'Review PPI jatuh tempo dalam 7 hari.';
+      }
+    } else {
+      priority = 5;
+      priorityLabel = 'Belum Dijadwalkan';
+      issue = 'Tanggal review berikutnya belum ditetapkan.';
+    }
+
+    // Cek evaluasi terbaru pada setiap tujuan di kategori ini.
+    const matchingReviews = reviewRows.filter(function(r) {
+      return String(r.ppiId) === String(p.id);
+    });
+    const reviewStatuses = matchingReviews.map(function(r) {
+      const latest = latestReview[String(r.ppiId) + '|' + String(r.goalIndex || 0)];
+      return latest ? latest.status : r.status;
+    });
+    const needsAction = reviewStatuses.some(function(st) {
+      return st === 'Belum Tercapai' || st === 'Sebagian Tercapai';
+    });
+    if (needsAction) {
+      targetNotAchieved++;
+      if (priority > 4) {
+        priority = 4;
+        priorityLabel = 'Perlu Tindak Lanjut';
+        issue = 'Target terakhir belum sepenuhnya tercapai.';
+      } else if (issue) {
+        issue += ' Target terakhir juga perlu ditindaklanjuti.';
+      }
+    }
+
+    if (priority < 5 || statusPPI !== 'Disetujui') {
+      const studentId = String(student.id);
+      const prev = followMap[studentId];
+      const row = {
+        studentId: studentId,
+        studentName: student.nama,
+        kelas: student.kelas,
+        categoryId: p.categoryId,
+        categoryTitle: p.categoryTitle,
+        ppiId: p.id,
+        statusPPI: statusPPI,
+        nextReviewDate: reviewDate,
+        reviewStatus: reviewStatuses.length ? reviewStatuses[reviewStatuses.length - 1] : 'Belum Dievaluasi',
+        priority: priority,
+        priorityLabel: priorityLabel,
+        issue: issue || (statusPPI !== 'Disetujui' ? 'Matriks PPI belum disetujui.' : 'Perlu pemantauan.'),
+        daysOffset: daysOffset
+      };
+      if (!prev || row.priority < prev.priority) followMap[studentId] = row;
+      monitoringRows.push(row);
+    }
+  });
+
+  // Murid yang belum memiliki PPI sama sekali juga perlu perhatian.
+  students.forEach(function(s) {
+    const hasPPI = ppiRows.some(function(p) { return String(p.studentId) === String(s.id); });
+    if (!hasPPI && s.indikasiUtama && s.indikasiUtama !== 'Belum Diasesmen') {
+      const row = {
+        studentId: String(s.id), studentName: s.nama, kelas: s.kelas, categoryId: '',
+        categoryTitle: 'Belum ada matriks PPI', ppiId: '', statusPPI: String(s.statusPPI || 'Belum Disetujui'),
+        nextReviewDate: '', reviewStatus: 'Belum Dievaluasi', priority: 1, priorityLabel: 'PPI Belum Dibuat',
+        issue: 'Murid sudah memiliki hasil asesmen tetapi belum memiliki matriks PPI.', daysOffset: null
+      };
+      const prev = followMap[String(s.id)];
+      if (!prev || row.priority < prev.priority) followMap[String(s.id)] = row;
+      monitoringRows.push(row);
+    }
+  });
+
+  const followUps = Object.keys(followMap).map(function(k) { return followMap[k]; })
+    .sort(function(a,b) { return a.priority - b.priority || String(a.nextReviewDate).localeCompare(String(b.nextReviewDate)) || String(a.studentName).localeCompare(String(b.studentName)); })
+    .slice(0, 200);
+
+  const statusCounts = {};
+  ppiRows.forEach(function(p) {
+    const st = String(p.status || 'Draft');
+    statusCounts[st] = (statusCounts[st] || 0) + 1;
+  });
+
+  return {
+    today: todayKey,
+    totalStudents: students.length,
+    activePPI: activePPI,
+    pendingApproval: pendingApprovalStudents,
+    overdue: overdue,
+    dueToday: dueToday,
+    dueSoon: dueSoon,
+    targetNotAchieved: targetNotAchieved,
+    statusCounts: statusCounts,
+    followUps: followUps
+  };
+}
+
+function getPPIMonitoringDashboard(token) {
+  const user = requireSession_(token);
+  const data = buildPPIMonitoringDashboard_();
+  writeAudit_(user, 'READ', 'PPI_MONITORING', '', 'Memuat dashboard monitoring PPI');
+  return data;
+}
+
+
+
+// ==============================
+// REKAP SEKOLAH & NOTIFIKASI
+// ==============================
+function getSchoolPPIOverview(token) {
+  const user = requireSession_(token);
+  const students = readStudents_();
+  const ppiSheet = getDb_().getSheetByName(SHEETS.PPI);
+  const ppiRows = (ppiSheet && ppiSheet.getLastRow() >= 2) ? ppiSheet.getDataRange().getValues().slice(1).map(rowToPPI_) : [];
+  const monitoring = buildPPIMonitoringDashboard_();
+  const reviewSheet = getDb_().getSheetByName(SHEETS.PPI_REVIEW);
+  const reviewRows = (reviewSheet && reviewSheet.getLastRow() >= 2) ? reviewSheet.getDataRange().getValues().slice(1).map(rowToPPIReview_) : [];
+
+  const classMap = {};
+  const categoryMap = {};
+  students.forEach(function(s) {
+    const kelas = String(s.kelas || 'Belum Diisi').trim() || 'Belum Diisi';
+    if (!classMap[kelas]) classMap[kelas] = {kelas: kelas, total: 0, assessed: 0, ppi: 0, approved: 0};
+    classMap[kelas].total++;
+    if (s.indikasiUtama && s.indikasiUtama !== 'Belum Diasesmen') classMap[kelas].assessed++;
+    if (ppiRows.some(function(p){ return String(p.studentId) === String(s.id); })) classMap[kelas].ppi++;
+    if (String(s.statusPPI || '').toLowerCase() === 'disetujui') classMap[kelas].approved++;
+  });
+
+  const latestByGoal = {};
+  reviewRows.forEach(function(r) {
+    const key = String(r.ppiId) + '|' + String(r.goalIndex || 0);
+    const prev = latestByGoal[key];
+    if (!prev || (String(r.reviewDate || '') + '|' + String(r.updatedAt || '')) > (String(prev.reviewDate || '') + '|' + String(prev.updatedAt || ''))) latestByGoal[key] = r;
+  });
+  ppiRows.forEach(function(p) {
+    const key = String(p.categoryId || 'lainnya');
+    if (!categoryMap[key]) categoryMap[key] = {categoryId:key, categoryTitle:String(p.categoryTitle || key), total:0, approved:0, needsFollowUp:0};
+    categoryMap[key].total++;
+    if (String(p.status || '').toLowerCase() === 'disetujui') categoryMap[key].approved++;
+    const reviews = reviewRows.filter(function(r){ return String(r.ppiId) === String(p.id); });
+    const needs = reviews.some(function(r){
+      const latest = latestByGoal[String(r.ppiId)+'|'+String(r.goalIndex || 0)];
+      const st = latest ? latest.status : r.status;
+      return st === 'Belum Tercapai' || st === 'Sebagian Tercapai';
+    });
+    if (needs) categoryMap[key].needsFollowUp++;
+  });
+
+  const total = students.length;
+  const assessed = students.filter(function(s){ return s.indikasiUtama && s.indikasiUtama !== 'Belum Diasesmen'; }).length;
+  const withPPI = ppiRows.reduce(function(set,p){ set[String(p.studentId)] = true; return set; }, {});
+  const ppiStudentCount = Object.keys(withPPI).length;
+  const approvedStudents = students.filter(function(s){ return String(s.statusPPI || '').toLowerCase() === 'disetujui'; }).length;
+
+  writeAudit_(user, 'READ', 'PPI_OVERVIEW', '', 'Memuat rekap PPI tingkat sekolah');
+  return {
+    totalStudents: total,
+    assessed: assessed,
+    ppiStudents: ppiStudentCount,
+    approvedStudents: approvedStudents,
+    overdue: monitoring.overdue || 0,
+    dueToday: monitoring.dueToday || 0,
+    dueSoon: monitoring.dueSoon || 0,
+    targetNotAchieved: monitoring.targetNotAchieved || 0,
+    classes: Object.keys(classMap).sort().map(function(k){ return classMap[k]; }),
+    categories: Object.keys(categoryMap).sort(function(a,b){ return categoryMap[b].total - categoryMap[a].total; }).map(function(k){ return categoryMap[k]; })
+  };
+}
+
+function getNotificationRecipients_() {
+  const sheet = getDb_().getSheetByName(SHEETS.USERS);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getDataRange().getValues().slice(1).map(function(r){
+    return {id:String(r[0]||''), username:String(r[1]||''), name:String(r[3]||''), role:String(r[4]||''), status:String(r[5]||''), email:normalizeEmail_(r[8])};
+  }).filter(function(u){ return u.status === 'AKTIF' && u.email && ['GPK','BK'].indexOf(u.role) !== -1 && isValidEmail_(u.email); });
+}
+
+function getTodayKey_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+function hasNotificationLog_(recipient, type, dateKey) {
+  const sheet = getDb_().getSheetByName(SHEETS.NOTIFICATION_LOG);
+  if (!sheet || sheet.getLastRow() < 2) return false;
+  const values = sheet.getDataRange().getValues();
+  return values.slice(1).some(function(r){ return normalizeEmail_(r[2]) === normalizeEmail_(recipient) && String(r[3]) === String(type) && String(r[4]) === String(dateKey) && String(r[6]).toUpperCase() === 'SENT'; });
+}
+
+function logNotification_(recipient, type, dateKey, subject, status, details) {
+  const sheet = getDb_().getSheetByName(SHEETS.NOTIFICATION_LOG);
+  sheet.appendRow([Utilities.getUuid(), new Date(), recipient, type, dateKey, subject, status, details || '']);
+}
+
+function sendDailyPPINotifications(forceSend) {
+  setupDatabase();
+  const recipients = getNotificationRecipients_();
+  const data = buildPPIMonitoringDashboard_();
+  const actionable = (data.pendingApproval || 0) + (data.overdue || 0) + (data.dueToday || 0) + (data.dueSoon || 0) + (data.targetNotAchieved || 0);
+  if (!actionable) return {ok:true, sent:0, skipped:0, message:'Tidak ada tindak lanjut PPI yang perlu dinotifikasi.'};
+  if (!recipients.length) return {ok:true, sent:0, skipped:0, message:'Belum ada penerima notifikasi aktif yang memiliki email.'};
+
+  const dateKey = getTodayKey_();
+  const subject = 'Si-Asesmen MBK — Ringkasan Tindak Lanjut PPI';
+  const appUrl = ScriptApp.getService().getUrl() || '';
+  const lines = [
+    'Ringkasan tindak lanjut PPI sekolah untuk ' + dateKey + ':',
+    '',
+    'PPI belum disetujui : ' + (data.pendingApproval || 0),
+    'Review terlambat     : ' + (data.overdue || 0),
+    'Review hari ini      : ' + (data.dueToday || 0),
+    'Review ≤ 7 hari      : ' + (data.dueSoon || 0),
+    'Target perlu tindak lanjut : ' + (data.targetNotAchieved || 0),
+    '',
+    appUrl ? 'Buka aplikasi: ' + appUrl : 'Buka aplikasi Si-Asesmen MBK melalui alamat Web App Anda.',
+    '',
+    'Email ini hanya berisi ringkasan. Detail data murid tetap diakses melalui aplikasi sesuai hak akses pengguna.'
+  ];
+  const body = lines.join('\n');
+  let sent = 0, skipped = 0;
+  const quota = Number(MailApp.getRemainingDailyQuota() || 0);
+  if (quota <= 0) throw new Error('Kuota email Apps Script hari ini tidak tersedia.');
+
+  recipients.forEach(function(r){
+    if (!forceSend && hasNotificationLog_(r.email, 'DAILY_PPI', dateKey)) { skipped++; return; }
+    if (sent >= quota) { skipped++; return; }
+    try {
+      MailApp.sendEmail({to:r.email, subject:subject, body:body, name:'Si-Asesmen MBK'});
+      logNotification_(r.email, 'DAILY_PPI', dateKey, subject, 'SENT', 'Ringkasan PPI harian');
+      sent++;
+    } catch (e) {
+      logNotification_(r.email, 'DAILY_PPI', dateKey, subject, 'FAILED', String(e.message || e));
+    }
+  });
+  return {ok:true, sent:sent, skipped:skipped, message:'Notifikasi diproses. Terkirim: '+sent+'. Dilewati: '+skipped+'.'};
+}
+
+function sendPPINotificationsNow(token) {
+  const user = requireSession_(token, ['GPK']);
+  const result = sendDailyPPINotifications(true);
+  writeAudit_(user, 'NOTIFY', 'PPI', '', 'Mengirim notifikasi PPI manual: ' + result.message);
+  return result;
+}
+
+function setupDailyPPIEmailTrigger(token) {
+  const user = requireSession_(token, ['GPK']);
+  const existing = ScriptApp.getProjectTriggers().filter(function(t){ return t.getHandlerFunction() === 'sendDailyPPINotifications'; });
+  if (!existing.length) {
+    ScriptApp.newTrigger('sendDailyPPINotifications').timeBased().everyDays(1).atHour(7).create();
+  }
+  writeAudit_(user, 'CONFIG', 'TRIGGER', 'PPI_DAILY_EMAIL', 'Mengaktifkan trigger notifikasi PPI harian');
+  return {ok:true, active:true, message:'Trigger notifikasi PPI harian aktif. Waktu target sekitar pukul 07.00 sesuai zona waktu project.'};
+}
+
+function getPPIEmailNotificationStatus(token) {
+  requireSession_(token, ['GPK']);
+  const triggers = ScriptApp.getProjectTriggers().filter(function(t){ return t.getHandlerFunction() === 'sendDailyPPINotifications'; });
+  const recipients = getNotificationRecipients_();
+  return {active:triggers.length > 0, recipients:recipients.map(function(r){ return {name:r.name, role:r.role, email:r.email}; })};
+}
+
+// ==============================
+// USER MANAGEMENT
+// ==============================
+function getUsers(token) {
+  const user = requireSession_(token, ['GPK']);
+  const sheet = getDb_().getSheetByName(SHEETS.USERS);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const values = sheet.getDataRange().getValues();
+  writeAudit_(user, 'READ', 'USERS', '', 'Memuat daftar pengguna');
+  return values.slice(1).map(function(r) {
+    return {
+      id: String(r[0] || ''),
+      username: String(r[1] || ''),
+      name: String(r[3] || ''),
+      role: String(r[4] || ''),
+      status: String(r[5] || ''),
+      createdAt: r[6] ? new Date(r[6]).toISOString() : '',
+      updatedAt: r[7] ? new Date(r[7]).toISOString() : '',
+      email: String(r[8] || '')
+    };
+  });
+}
+
+function saveUser(token, data) {
+  const currentUser = requireSession_(token, ['GPK']);
+  data = data || {};
+  const username = normalizeUsername_(data.username);
+  const name = String(data.name || '').trim();
+  const role = String(data.role || '').trim().toUpperCase();
+  const status = String(data.status || 'AKTIF').trim().toUpperCase();
+  const password = String(data.password || '');
+  const email = normalizeEmail_(data.email);
+
+  if (!username || username.length < 3) throw new Error('Username minimal 3 karakter.');
+  if (!/^[a-z0-9._-]+$/.test(username)) throw new Error('Username hanya boleh berisi huruf kecil, angka, titik, garis bawah, dan tanda minus.');
+  if (!name) throw new Error('Nama pengguna wajib diisi.');
+  if (!isValidEmail_(email)) throw new Error('Format email pengguna tidak valid.');
+  if (['GPK','BK','MAPEL'].indexOf(role) === -1) throw new Error('Role tidak valid.');
+  if (['AKTIF','NONAKTIF'].indexOf(status) === -1) throw new Error('Status tidak valid.');
+  if (!data.id && password.length < 6) throw new Error('Password pengguna baru minimal 6 karakter.');
+  if (data.id && password && password.length < 6) throw new Error('Password minimal 6 karakter.');
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sheet = getDb_().getSheetByName(SHEETS.USERS);
+    const values = sheet.getDataRange().getValues();
+    const now = new Date();
+    let rowNumber = -1;
+    let existingRow = null;
+
+    for (let i = 1; i < values.length; i++) {
+      if (String(values[i][0]) === String(data.id || '')) {
+        rowNumber = i + 1;
+        existingRow = values[i];
+      }
+      if (normalizeUsername_(values[i][1]) === username && String(values[i][0]) !== String(data.id || '')) {
+        throw new Error('Username sudah digunakan.');
+      }
+    }
+
+    if (data.id && rowNumber < 0) throw new Error('Pengguna tidak ditemukan.');
+
+    if (data.id && String(existingRow[0]) === String(currentUser.id) && status !== 'AKTIF') {
+      throw new Error('Anda tidak dapat menonaktifkan akun sendiri.');
+    }
+
+    if (data.id && rowNumber > 0) {
+      const oldRole = String(existingRow[4] || '').toUpperCase();
+      const oldStatus = String(existingRow[5] || '').toUpperCase();
+      if (oldRole === 'GPK' && oldStatus === 'AKTIF' && (role !== 'GPK' || status !== 'AKTIF')) {
+        let activeGpk = 0;
+        for (let j = 1; j < values.length; j++) {
+          if (String(values[j][4] || '').toUpperCase() === 'GPK' && String(values[j][5] || '').toUpperCase() === 'AKTIF') activeGpk++;
+        }
+        if (activeGpk <= 1) throw new Error('Tidak dapat mengubah role/status satu-satunya GPK aktif.');
+      }
+    }
+
+    let hash = rowNumber > 0 ? String(existingRow[2] || '') : '';
+    if (password) hash = hashPassword_(password);
+
+    const id = data.id || Utilities.getUuid();
+    const createdAt = rowNumber > 0 ? (existingRow[6] || now) : now;
+    const row = [id, username, hash, name, role, status, createdAt, now, email];
+
+    if (rowNumber > 0) {
+      sheet.getRange(rowNumber, 1, 1, row.length).setValues([row]);
+      writeAudit_(currentUser, 'UPDATE', 'USER', id, 'Memperbarui pengguna ' + username);
+    } else {
+      sheet.appendRow(row);
+      writeAudit_(currentUser, 'CREATE', 'USER', id, 'Menambahkan pengguna ' + username);
+    }
+
+    return {ok: true, users: getUsersWithoutAudit_()};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getUsersWithoutAudit_() {
+  const sheet = getDb_().getSheetByName(SHEETS.USERS);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getDataRange().getValues().slice(1).map(function(r) {
+    return {
+      id: String(r[0] || ''),
+      username: String(r[1] || ''),
+      name: String(r[3] || ''),
+      role: String(r[4] || ''),
+      status: String(r[5] || ''),
+      createdAt: r[6] ? new Date(r[6]).toISOString() : '',
+      updatedAt: r[7] ? new Date(r[7]).toISOString() : '',
+      email: String(r[8] || '')
+    };
+  });
+}
+
+function deleteUser(token, userId) {
+  const currentUser = requireSession_(token, ['GPK']);
+  if (String(userId) === String(currentUser.id)) throw new Error('Akun yang sedang digunakan tidak dapat dihapus.');
+
+  const sheet = getDb_().getSheetByName(SHEETS.USERS);
+  const values = sheet.getDataRange().getValues();
+  let gpkCount = 0;
+  values.slice(1).forEach(function(r) {
+    if (String(r[4]).toUpperCase() === 'GPK' && String(r[5]).toUpperCase() === 'AKTIF') gpkCount++;
+  });
+
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(userId)) {
+      if (String(values[i][4]).toUpperCase() === 'GPK' && String(values[i][5]).toUpperCase() === 'AKTIF' && gpkCount <= 1) {
+        throw new Error('Tidak dapat menghapus satu-satunya GPK aktif.');
+      }
+      const username = String(values[i][1]);
+      sheet.deleteRow(i + 1);
+      writeAudit_(currentUser, 'DELETE', 'USER', userId, 'Menghapus pengguna ' + username);
+      return {ok: true, users: getUsersWithoutAudit_()};
+    }
+  }
+  throw new Error('Pengguna tidak ditemukan.');
+}
+
+function getAuditLogs(token, limit) {
+  const user = requireSession_(token, ['GPK']);
+  const sheet = getDb_().getSheetByName(SHEETS.AUDIT);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const max = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const values = sheet.getDataRange().getValues();
+  const rows = values.slice(1).slice(-max).reverse();
+  writeAudit_(user, 'READ', 'AUDIT_LOG', '', 'Memuat log audit');
+  return rows.map(function(r) {
+    return {
+      timestamp: r[0] ? new Date(r[0]).toISOString() : '',
+      userId: String(r[1] || ''),
+      username: String(r[2] || ''),
+      action: String(r[3] || ''),
+      targetType: String(r[4] || ''),
+      targetId: String(r[5] || ''),
+      description: String(r[6] || '')
+    };
+  });
+}
+
+function writeAudit_(user, action, targetType, targetId, description) {
+  try {
+    const sheet = getDb_().getSheetByName(SHEETS.AUDIT);
+    sheet.appendRow([
+      new Date(),
+      user ? user.id : '',
+      user ? user.username : '',
+      action,
+      targetType,
+      targetId || '',
+      description || ''
+    ]);
+  } catch (e) {
+    // Audit log tidak boleh menggagalkan transaksi utama.
+  }
+}
