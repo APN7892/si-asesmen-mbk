@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Si-Asesmen MBK</title>
+  <meta name="description" content="Sistem Asesmen Awal Murid Berkebutuhan Khusus">
+  <style>
+    :root{--maroon:#6b1025;--maroon-dark:#4a0b19;--cream:#fbf5e8;--gold:#c6a15b;--ink:#35131d}
+    *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--maroon-dark);color:var(--ink)}
+    .page{min-height:100%;display:flex;flex-direction:column;background:radial-gradient(circle at 50% -10%,#8a2942 0,#6b1025 45%,#4a0b19 100%)}
+    .topbar{height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 22px;background:rgba(74,11,25,.96);border-bottom:1px solid rgba(198,161,91,.35);color:#fff;position:sticky;top:0;z-index:5}
+    .brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.2px}.brand-mark{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:var(--maroon);border:1px solid rgba(198,161,91,.65);color:#fff;font-size:18px}.brand small{display:block;color:#e8d8bf;font-weight:500;font-size:11px;margin-top:2px}
+    .open{border:1px solid rgba(255,255,255,.18);background:var(--maroon);color:#fff;padding:9px 14px;border-radius:10px;text-decoration:none;font-weight:700;font-size:12px}
+    .shell{flex:1;padding:16px}.frame{width:100%;max-width:1600px;margin:0 auto;height:calc(100vh - 96px);min-height:620px;border:1px solid rgba(198,161,91,.55);border-radius:18px;overflow:hidden;background:var(--cream);box-shadow:0 18px 48px rgba(0,0,0,.28)}
+    iframe{width:100%;height:100%;border:0;display:block;background:var(--cream)}
+    .footer{padding:8px 16px 12px;text-align:center;color:#eadfcf;font-size:11px}
+    @media(max-width:700px){.topbar{height:58px;padding:0 12px}.brand small{display:none}.shell{padding:8px}.frame{height:calc(100vh - 84px);min-height:560px;border-radius:12px}.open{padding:8px 10px;font-size:11px}}
+  </style>
+</head>
+<body>
+<div class="page">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">✋</div>
+      <div>Si-Asesmen MBK<small>Sistem Asesmen Awal Murid Berkebutuhan Khusus</small></div>
+    </div>
+    <a id="openApp" class="open" href="#" target="_blank" rel="noopener">Buka Aplikasi</a>
+  </header>
+  <main class="shell">
+    <div class="frame">
+      <iframe id="appFrame" title="Si-Asesmen MBK" allow="clipboard-read; clipboard-write"></iframe>
+    </div>
+  </main>
+  <div class="footer">Si-Asesmen MBK • Frontend GitHub Pages • Backend Google Apps Script</div>
+</div>
+<script>
+  // GANTI URL DI BAWAH dengan URL Web App Apps Script Anda (/exec)
+  const APP_URL = 'PASTE_URL_WEB_APP_APPS_SCRIPT_DI_SINI';
+  const frame = document.getElementById('appFrame');
+  const open = document.getElementById('openApp');
+  if (APP_URL.startsWith('https://script.google.com/')) {
+    frame.src = APP_URL;
+    open.href = APP_URL;
+  } else {
+    frame.srcdoc = '<div style="font-family:Arial;padding:40px;text-align:center;color:#6b1025"><h2>Si-Asesmen MBK</h2><p>Masukkan URL Web App Apps Script pada <b>APP_URL</b> di index.html.</p></div>';
+    open.href = '#';
+    open.addEventListener('click', e => e.preventDefault());
+  }
+</script>
+</body>
+</html>
